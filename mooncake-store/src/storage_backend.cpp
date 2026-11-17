@@ -1,6 +1,8 @@
 #include "serializer.h"
 #include "storage_backend.h"
 
+#include <fstream>
+
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -2362,15 +2364,36 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
+                const auto tombstone = LoadTombstone(bucket_id, disk_index);
+                if (!tombstone.empty() &&
+                    std::all_of(meta.keys.begin(), meta.keys.end(),
+                                [&](const std::string& key) {
+                                    return tombstone.contains(key);
+                                })) {
+                    CleanupOrphanedBucket(bucket_id, disk_index);
+                    RemoveTombstone(bucket_id, disk_index);
+                    continue;
+                }
                 disk.total_size += meta.data_size + meta.meta_size;
                 disk.fifo_index.insert(bucket_id);
                 disk.lru_index.emplace(0LL, bucket_id);
                 for (size_t i = 0; i < meta.keys.size(); i++) {
-                    object_bucket_map_.insert(
-                        meta.keys[i], StorageObjectMetadata{
-                                          bucket_id, meta.metadatas[i].offset,
-                                          meta.metadatas[i].key_size,
-                                          meta.metadatas[i].data_size, ""});
+                    if (tombstone.contains(meta.keys[i])) {
+                        metadata->dead_bytes_ += meta.metadatas[i].data_size +
+                                                 meta.metadatas[i].key_size;
+                        continue;
+                    }
+                    StorageObjectMetadata object_metadata{
+                        bucket_id, meta.metadatas[i].offset,
+                        meta.metadatas[i].key_size, meta.metadatas[i].data_size,
+                        ""};
+                    if (!object_bucket_map_.insert(meta.keys[i],
+                                                   object_metadata) &&
+                        object_bucket_map_.find(meta.keys[i])->bucket_id <
+                            bucket_id) {
+                        object_bucket_map_.insert_or_assign(meta.keys[i],
+                                                            object_metadata);
+                    }
                 }
                 buckets_.emplace(bucket_id, std::move(metadata));
             }
@@ -2391,8 +2414,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 
                 std::string extension = entry.path().extension().string();
 
-                // Only process .bucket files
-                if (extension != BUCKET_DATA_FILE_SUFFIX) {
+                if (extension != BUCKET_DATA_FILE_SUFFIX &&
+                    extension != BUCKET_TOMBSTONE_FILE_SUFFIX) {
                     continue;
                 }
 
@@ -2417,8 +2440,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 // resolved path instead.
                 auto recovered = buckets_.find(bucket_id);
                 if (recovered != buckets_.end()) {
-                    auto live_path = GetBucketDataPath(
-                        bucket_id, recovered->second->disk_index);
+                    auto live_path =
+                        extension == BUCKET_DATA_FILE_SUFFIX
+                            ? GetBucketDataPath(bucket_id,
+                                                recovered->second->disk_index)
+                            : GetBucketTombstonePath(
+                                  bucket_id, recovered->second->disk_index);
                     if (live_path &&
                         fs::path(live_path.value()) == entry.path()) {
                         continue;
@@ -2653,19 +2680,26 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+        std::vector<size_t> live;
+        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            const auto* mapped =
+                object_bucket_map_.find(bucket_it->second->keys[i]);
+            if (mapped != nullptr && mapped->bucket_id == bucket_it->first) {
+                live.push_back(i);
+            }
+        }
+        if (static_cast<int64_t>(live.size()) > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
+                       << ", current_size=" << live.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
+        if (static_cast<int64_t>(live.size() + keys.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
-        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+        for (size_t i : live) {
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
@@ -3714,7 +3748,8 @@ BucketStorageBackend::PrepareEviction(
                 result.keys.push_back(key);
             }
         }
-        disk.total_size -= evict_meta->meta_size;
+        disk.total_size -= evict_meta->meta_size + evict_meta->dead_bytes_;
+        evicted_size += evict_meta->dead_bytes_;
         result.evicted_size += evicted_size;
 
         accumulated_freed_space +=
@@ -3787,7 +3822,7 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
                                            object_meta.data_size, ""});
             disk.total_size += object_meta.data_size + object_meta.key_size;
         }
-        disk.total_size += bucket_meta->meta_size;
+        disk.total_size += bucket_meta->meta_size + bucket_meta->dead_bytes_;
         // Both indexes must be restored. Forgetting fifo_index would leave the
         // bucket invisible to FIFO eviction for the rest of the process's life,
         // permanently holding quota that can never be reclaimed.
@@ -3866,6 +3901,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                     << meta_path.value() << ", error: " << ec.message();
                 bucket_cleanup_failed = true;
             }
+        }
+        if (!bucket_cleanup_failed) {
+            RemoveTombstone(bucket_id, bucket_disk);
         }
 
         // Wait for in-flight reads that started before the bucket was removed
@@ -4015,11 +4053,54 @@ BucketStorageBackend::EvictAboveDiskWatermark(
     return evicted_keys;
 }
 
+constexpr uint32_t kMaxTombstoneKeySize = 1 << 20;
+
 tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     int64_t bucket_id) {
     namespace fs = std::filesystem;
     std::shared_ptr<BucketMetadata> bucket_metadata;
     std::vector<std::string> keys_to_remove;
+    int delete_disk = 0;
+
+    // Drop the metadata first, while the bucket is still indexed: if the
+    // wait below times out, Init removes the orphan data file instead of
+    // restoring the bucket. If the metadata stays, every key is tombstoned
+    // so Init deletes the bucket; if that fails too, nothing changes and
+    // the caller retries.
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "DeleteBucket: bucket not found, bucket_id="
+                         << bucket_id;
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        keys_to_remove = bucket_it->second->keys;
+        delete_disk = bucket_it->second->disk_index;
+    }
+    std::error_code ec;
+    bool meta_kept = false;
+    auto meta_path_res = GetBucketMetadataPath(bucket_id, delete_disk);
+    if (meta_path_res) {
+        fs::remove(meta_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "DeleteBucket: failed to remove metadata file: "
+                       << meta_path_res.value() << ", error: " << ec.message();
+            const bool fits =
+                std::none_of(keys_to_remove.begin(), keys_to_remove.end(),
+                             [](const std::string& key) {
+                                 return key.size() > kMaxTombstoneKeySize;
+                             });
+            if (fits) {
+                if (!AppendTombstone(bucket_id, delete_disk, keys_to_remove)) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                meta_kept = true;
+            }
+            // Otherwise the data file goes below and Init drops the
+            // metadata that has no data.
+        }
+    }
 
     // Step 1: Remove bucket from metadata maps under exclusive lock
     {
@@ -4052,9 +4133,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
 
         // Subtract metadata size
-        disk.total_size -= bucket_metadata->meta_size;
+        disk.total_size -=
+            bucket_metadata->meta_size + bucket_metadata->dead_bytes_;
     }
     // Lock released - new readers can't find this bucket anymore
+    if (meta_kept) {
+        LOG(ERROR) << "DeleteBucket: bucket_id=" << bucket_id
+                   << " is deleted at the next start";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    RemoveTombstone(bucket_id, delete_disk);
 
     // Step 2: Wait for in-flight reads to complete
     // Readers that started before we removed from buckets_ still hold guards
@@ -4085,10 +4173,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
     }
 
-    // Step 3: Safe to delete files now - no readers are using them
-    std::error_code ec;
-    const int delete_disk = bucket_metadata->disk_index;
-
+    // Step 3: Safe to delete the data file now - no readers are using it
+    ec.clear();
     auto data_path_res = GetBucketDataPath(bucket_id, delete_disk);
     if (data_path_res) {
         fs::remove(data_path_res.value(), ec);
@@ -4098,21 +4184,125 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
                          << ", error: " << ec.message();
         }
     }
-
-    auto meta_path_res = GetBucketMetadataPath(bucket_id, delete_disk);
-    if (meta_path_res) {
-        ec.clear();
-        fs::remove(meta_path_res.value(), ec);
-        if (ec && ec != std::errc::no_such_file_or_directory) {
-            LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
-                         << meta_path_res.value()
-                         << ", error: " << ec.message();
-        }
+    {
+        SharedMutexLocker lock(&mutex_);
+        disks_[delete_disk].cached_disk_bytes = -1;
     }
 
     LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
               << ", keys_removed=" << keys_to_remove.size();
     return {};
+}
+
+std::vector<std::pair<int64_t, std::vector<std::string>>>
+BucketStorageBackend::GetReclaimCandidates(int64_t after_bucket_id,
+                                           size_t max_keys,
+                                           int64_t& next_cursor) const {
+    std::vector<std::pair<int64_t, std::vector<std::string>>> candidates;
+    next_cursor = after_bucket_id;
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto it = buckets_.upper_bound(after_bucket_id);
+    size_t num_keys = 0;
+    for (size_t n = 0; n < buckets_.size() && num_keys < max_keys; ++n, ++it) {
+        if (it == buckets_.end()) {
+            it = buckets_.begin();
+        }
+        const auto& [bucket_id, bucket] = *it;
+        std::vector<std::string> mapped_keys;
+        for (const auto& key : bucket->keys) {
+            const auto* mapped = object_bucket_map_.find(key);
+            if (mapped != nullptr && mapped->bucket_id == bucket_id) {
+                mapped_keys.push_back(key);
+            }
+        }
+        num_keys += mapped_keys.size();
+        candidates.emplace_back(bucket_id, std::move(mapped_keys));
+        next_cursor = bucket_id;
+    }
+    return candidates;
+}
+
+size_t BucketStorageBackend::RemoveDeadKeys(
+    const std::unordered_map<int64_t, std::vector<std::string>>&
+        dead_keys_by_bucket) {
+    // Keys still mapped to their bucket, per bucket that keeps a live key;
+    // buckets left without one are deleted whole.
+    struct Drop {
+        int disk_index;
+        std::vector<std::string> keys;
+    };
+    std::unordered_map<int64_t, Drop> drops;
+    std::vector<int64_t> empty_buckets;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (const auto& [bucket_id, dead_keys] : dead_keys_by_bucket) {
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it == buckets_.end()) {
+                continue;
+            }
+            const std::unordered_set<std::string> dead(dead_keys.begin(),
+                                                       dead_keys.end());
+            std::vector<std::string> drop;
+            bool has_live_key = false;
+            for (const auto& key : bucket_it->second->keys) {
+                const auto* mapped = object_bucket_map_.find(key);
+                if (mapped == nullptr || mapped->bucket_id != bucket_id) {
+                    continue;
+                }
+                if (dead.contains(key)) {
+                    drop.push_back(key);
+                } else {
+                    has_live_key = true;
+                }
+            }
+            if (!has_live_key) {
+                empty_buckets.push_back(bucket_id);
+            } else if (!drop.empty()) {
+                drops.emplace(bucket_id, Drop{bucket_it->second->disk_index,
+                                              std::move(drop)});
+            }
+        }
+    }
+    // Persist the drops first; a key whose drop is not on disk stays mapped
+    // and is retried on a later pass.
+    for (auto it = drops.begin(); it != drops.end();) {
+        it = AppendTombstone(it->first, it->second.disk_index, it->second.keys)
+                 ? std::next(it)
+                 : drops.erase(it);
+    }
+    size_t removed_keys = 0;
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& [bucket_id, drop] : drops) {
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it == buckets_.end()) {
+                continue;
+            }
+            auto& bucket = *bucket_it->second;
+            for (const auto& key : drop.keys) {
+                if (object_bucket_map_.erase_if(key, [&](const auto& mapped) {
+                        if (mapped.bucket_id != bucket_id) return false;
+                        bucket.dead_bytes_ +=
+                            mapped.data_size + mapped.key_size;
+                        return true;
+                    })) {
+                    ++removed_keys;
+                }
+            }
+        }
+    }
+
+    size_t deleted_buckets = 0;
+    for (int64_t bucket_id : empty_buckets) {
+        if (DeleteBucket(bucket_id)) {
+            ++deleted_buckets;
+        }
+    }
+    if (removed_keys != 0 || deleted_buckets != 0) {
+        LOG(INFO) << "RemoveDeadKeys: removed_keys=" << removed_keys
+                  << " deleted_buckets=" << deleted_buckets;
+    }
+    return deleted_buckets;
 }
 
 void BucketStorageBackend::RemoveAll() {
@@ -4212,6 +4402,109 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     return {};
+}
+
+tl::expected<std::string, ErrorCode>
+BucketStorageBackend::GetBucketTombstonePath(int64_t bucket_id,
+                                             int disk_index) const {
+    if (disk_index < 0 || disk_index >= static_cast<int>(disk_paths_.size())) {
+        LOG(ERROR) << "Invalid disk index " << disk_index << " for bucket "
+                   << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const std::string& root = disk_paths_[disk_index];
+    std::string sep = root.empty() || root.back() == '/' ? "" : "/";
+    return root + sep + std::to_string(bucket_id) +
+           BUCKET_TOMBSTONE_FILE_SUFFIX;
+}
+
+// Records are a 4-byte length followed by the key; a torn tail is ignored.
+bool BucketStorageBackend::AppendTombstone(
+    int64_t bucket_id, int disk_index,
+    const std::vector<std::string>& keys) const {
+    std::string records;
+    for (const auto& key : keys) {
+        if (key.size() > kMaxTombstoneKeySize) {
+            return false;
+        }
+        const uint32_t size = static_cast<uint32_t>(key.size());
+        records.append(reinterpret_cast<const char*>(&size), sizeof(size));
+        records.append(key);
+    }
+    const auto path = GetBucketTombstonePath(bucket_id, disk_index);
+    if (!path) {
+        return false;
+    }
+    const int fd =
+        ::open(path->c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open tombstone " << *path << ": "
+                   << strerror(errno);
+        return false;
+    }
+    struct stat before{};
+    if (::fstat(fd, &before) != 0) {
+        ::close(fd);
+        return false;
+    }
+    size_t written = 0;
+    while (written < records.size()) {
+        const ssize_t n =
+            ::write(fd, records.data() + written, records.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += static_cast<size_t>(n);
+    }
+    bool ok = written == records.size() && ::fdatasync(fd) == 0;
+    if (!ok && ::ftruncate(fd, before.st_size) != 0) {
+        LOG(ERROR) << "Failed to roll back tombstone " << *path << ": "
+                   << strerror(errno);
+    }
+    ::close(fd);
+    if (ok && before.st_size == 0) {
+        // A new file: persist its directory entry too.
+        const int dir_fd = ::open(disk_paths_[disk_index].c_str(),
+                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        ok = dir_fd >= 0 && ::fsync(dir_fd) == 0;
+        if (dir_fd >= 0) ::close(dir_fd);
+    }
+    LOG_IF(ERROR, !ok) << "Failed to write tombstone " << *path;
+    return ok;
+}
+
+std::unordered_set<std::string> BucketStorageBackend::LoadTombstone(
+    int64_t bucket_id, int disk_index) const {
+    std::unordered_set<std::string> keys;
+    const auto path = GetBucketTombstonePath(bucket_id, disk_index);
+    if (!path) return keys;
+    std::ifstream in(*path, std::ios::binary);
+    if (!in) return keys;
+    uint64_t complete = 0;
+    uint32_t size = 0;
+    while (in.read(reinterpret_cast<char*>(&size), sizeof(size)) &&
+           size <= kMaxTombstoneKeySize) {
+        std::string key(size, '\0');
+        if (!in.read(key.data(), size)) break;
+        keys.insert(std::move(key));
+        complete += sizeof(size) + size;
+    }
+    in.close();
+    // Cut a torn tail so later appends stay readable.
+    std::error_code ec;
+    if (std::filesystem::file_size(*path, ec) != complete && !ec) {
+        LOG(WARNING) << "Truncating torn tombstone " << *path << " to "
+                     << complete << " bytes";
+        std::filesystem::resize_file(*path, complete, ec);
+    }
+    return keys;
+}
+
+void BucketStorageBackend::RemoveTombstone(int64_t bucket_id,
+                                           int disk_index) const {
+    const auto path = GetBucketTombstonePath(bucket_id, disk_index);
+    if (!path) return;
+    std::error_code ec;
+    std::filesystem::remove(*path, ec);
 }
 
 tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(

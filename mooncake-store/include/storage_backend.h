@@ -58,6 +58,10 @@ struct BucketMetadata {
     // this bucket's files. Not serialized: Init() re-derives it from the disk
     // the .meta file was found on.
     int disk_index = 0;
+    // Bytes of keys dropped as dead whose data still sits in the bucket
+    // file; kept in total_size_ until the file is deleted. Guarded by the
+    // backend mutex.
+    int64_t dead_bytes_ = 0;
 
     // Default constructor
     BucketMetadata() = default;
@@ -261,6 +265,17 @@ struct FileStorageConfig {
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
+
+    // Interval between passes that delete local disk data of objects the
+    // master no longer tracks (bucket backend only); 0 disables them.
+    uint32_t reclaim_interval_seconds = 10;
+    // Every stored key is checked against the master once per this many
+    // seconds; each pass checks the matching share of the keys.
+    uint32_t reclaim_cycle_seconds = 120;
+    // After a start on a non-empty directory, reclaim waits for a rescan run
+    // this long after start: a previous incarnation's replicas may hide the
+    // startup registration until the master offboards it.
+    uint32_t reclaim_startup_grace_seconds = 120;
 
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
@@ -1024,6 +1039,28 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
+    /**
+     * @brief Returns the buckets that follow after_bucket_id (wrapping
+     * around, at most one lap), each with the keys the index still maps to
+     * it, stopping at the first bucket that brings the key count to max_keys.
+     * @param next_cursor Output: the last bucket returned, to pass back as
+     * after_bucket_id on the next call.
+     */
+    std::vector<std::pair<int64_t, std::vector<std::string>>>
+    GetReclaimCandidates(int64_t after_bucket_id, size_t max_keys,
+                         int64_t& next_cursor) const;
+
+    /**
+     * @brief Drops keys the master no longer tracks. A key is dropped only
+     * while the index still maps it to the bucket it was found in, so a key
+     * re-offloaded into a newer bucket keeps its mapping. Buckets left with
+     * no mapped key are deleted. Buckets that keep a live key stay on disk.
+     * @return Number of buckets deleted.
+     */
+    size_t RemoveDeadKeys(
+        const std::unordered_map<int64_t, std::vector<std::string>>&
+            dead_keys_by_bucket);
+
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
@@ -1322,6 +1359,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::vector<int> owner_lock_fds_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+    // Keys dropped from a bucket that still holds live keys, so that Init
+    // and ScanMeta do not bring them back after a restart.
+    static constexpr const char* BUCKET_TOMBSTONE_FILE_SUFFIX = ".dead";
+    tl::expected<std::string, ErrorCode> GetBucketTombstonePath(
+        int64_t bucket_id, int disk_index) const;
+    bool AppendTombstone(int64_t bucket_id, int disk_index,
+                         const std::vector<std::string>& keys) const;
+    std::unordered_set<std::string> LoadTombstone(int64_t bucket_id,
+                                                  int disk_index) const;
+    void RemoveTombstone(int64_t bucket_id, int disk_index) const;
 
     /**
      * @brief A shared mutex to protect concurrent access to metadata.

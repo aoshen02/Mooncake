@@ -309,7 +309,60 @@ class FileStorage {
      * Called after master restart recovery to sync SSD object metadata.
      * This is the same logic as the ScanMeta step in Init().
      */
-    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects(
+        const std::unordered_set<std::string>* only = nullptr,
+        std::unordered_set<std::string>* known = nullptr);
+
+    /**
+     * @brief Deletes local disk data of objects the master no longer tracks.
+     * Every remove path on the master (remove, regex, remove_all, lease or
+     * TTL expiry) only drops metadata, so the holder reconciles its bucket
+     * index against the master: each pass checks a few buckets and records
+     * keys the master reports missing, or tracks without this holder's
+     * LOCAL_DISK replica. They are dropped on the next tick, after its
+     * heartbeat succeeded, so a master restart in between is seen by the
+     * remount path first. Buckets left without live keys are deleted.
+     * Called from Heartbeat only.
+     */
+    void ReclaimRemovedObjects();
+
+    // Keys (and their metadata) the master does not have; the rest are
+    // stale copies of objects put again. All keys when reclaim is off.
+    tl::expected<
+        std::pair<std::vector<std::string>, std::vector<StorageObjectMetadata>>,
+        ErrorCode>
+    KeysMasterLacks(const std::vector<std::string>& keys,
+                    const std::vector<StorageObjectMetadata>& metadatas,
+                    const std::unordered_set<std::string>* only = nullptr,
+                    std::unordered_set<std::string>* known = nullptr);
+
+    // After a start on a non-empty directory, owes a rescan that may start
+    // only after reclaim_startup_grace_seconds; reclaim waits for it.
+    void ArmStartupRescan();
+
+    // True unless a metadata rescan is running or still owed to a master
+    // that lost our LOCAL_DISK segment.
+    bool MasterKnowsOurObjects() const;
+
+    /**
+     * @brief Asks the master about storage keys found in the given buckets
+     * and adds the ones whose local copy is dead to dead_keys: objects the
+     * master no longer has or, for offload_targets, objects it has without
+     * this holder's LOCAL_DISK replica. Returns how many it added.
+     */
+    size_t FindDeadKeys(
+        const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
+        bool offload_targets,
+        std::unordered_map<int64_t, std::vector<std::string>>& dead_keys);
+
+    /**
+     * @brief Drops local copies of offload targets that the master does not
+     * know as this holder's LOCAL_DISK replica, so a removed key that was
+     * put again is offloaded afresh instead of skipped as already persisted.
+     */
+    void DropStaleCopiesOfOffloadTargets(
+        BucketStorageBackend& backend,
+        const std::unordered_map<std::string, int64_t>& storage_object_sizes);
 
     // Backend disk-error observer. Runs inline on the failing I/O thread, so
     // it makes no RPC and takes no lock that I/O or the heartbeat holds.
@@ -456,6 +509,24 @@ class FileStorage {
     std::function<int(bool sync_first)> test_filesystem_check_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
+
+    // Reclaim state, touched by the heartbeat thread only.
+    std::unordered_map<int64_t, std::vector<std::string>> reclaim_dead_keys_;
+    int64_t reclaim_cursor_ = -1;
+    // Bumped each time the master reports our segment lost; a rescan that
+    // started at epoch E and succeeded publishes E. Reclaim needs them equal.
+    std::atomic<uint64_t> segment_lost_epoch_{0};
+    std::atomic<uint64_t> rescanned_epoch_{0};
+    std::chrono::steady_clock::time_point rescan_not_before_{};
+    // Keys the master already had when Init registered ours: only these can
+    // be hidden by a previous incarnation's replicas. The startup rescan
+    // (epoch startup_epoch_) registers just those; others missing by then
+    // were removed by a client.
+    std::unordered_set<std::string> startup_known_keys_;
+    uint64_t startup_epoch_ = 0;
+    uint32_t reclaim_passes_left_ = 0;
+    size_t reclaim_keys_per_pass_ = 0;
+    std::chrono::steady_clock::time_point next_reclaim_at_{};
 };
 
 }  // namespace mooncake
