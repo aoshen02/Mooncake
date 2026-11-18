@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_set>
+#include <variant>
 #include <string>
 #include <thread>
 
@@ -128,12 +130,270 @@ class FileStorageTest : public ::testing::Test {
     static uintmax_t StoredFileBytes(const std::string& path) {
         uintmax_t bytes = 0;
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
-            if (!entry.is_regular_file()) continue;
+            // Tombstones are bookkeeping, not object data.
+            if (!entry.is_regular_file() ||
+                entry.path().extension() == ".dead") {
+                continue;
+            }
             struct stat info{};
             EXPECT_EQ(0, ::stat(entry.path().c_str(), &info));
             bytes += static_cast<uintmax_t>(info.st_blocks) * 512;
         }
         return bytes;
+    }
+
+    enum class ReclaimCase {
+        kRemoved,
+        kRePut,
+        kRetriedTask,
+        kSegmentLost,
+        kOffloadFails,
+        kRescanSkipsRePut,
+        kStartupGate,
+        kRescanQueryFails
+    };
+
+    // Fails every write while `fail` is set, like a full disk.
+    class FailingWriteBackend : public BucketStorageBackend {
+       public:
+        using BucketStorageBackend::BucketStorageBackend;
+        tl::expected<int64_t, ErrorCode> BatchOffload(
+            const std::unordered_map<std::string, std::vector<Slice>>& batch,
+            std::function<ErrorCode(const std::vector<std::string>&,
+                                    std::vector<StorageObjectMetadata>&)>
+                complete,
+            EvictionHandler eviction = nullptr) override {
+            if (fail.load()) {
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            return BucketStorageBackend::BatchOffload(
+                batch, std::move(complete), std::move(eviction));
+        }
+        std::atomic<bool> fail{false};
+    };
+
+    // One object offloaded into its own bucket, then: removed (its files go
+    // after two heartbeats), removed and put again (the fresh value is
+    // offloaded at once), or offloaded again by a retried task (the live
+    // copy stays).
+    void RunReclaimScenario(ReclaimCase reclaim_case) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        constexpr size_t kSize = 128;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const std::string key = "reclaim-key";
+        const auto storage_key = TenantId::Default().MakeScopedKey(key);
+        auto put = [&](char fill, const std::string& put_key = "reclaim-key") {
+            auto* buffer = allocator.allocate(kSize);
+            ASSERT_NE(buffer, nullptr);
+            std::memset(buffer, fill, kSize);
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            std::vector<Slice> slices{{buffer, kSize}};
+            ASSERT_TRUE(client->Put(put_key, slices, replicate));
+            allocator.deallocate(buffer, kSize);
+        };
+        auto drain_tasks = [&] {
+            std::vector<OffloadTaskItem> tasks;
+            EXPECT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+            return tasks;
+        };
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/reclaim";
+        config.local_buffer_size = 1024 * 1024;
+        config.reclaim_interval_seconds = 1;
+        config.reclaim_cycle_seconds = 1;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 1;
+        auto backend =
+            std::make_shared<FailingWriteBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        const auto baseline = StoredFileBytes(config.storage_filepath);
+
+        auto bucket_of = [&]() -> std::optional<int64_t> {
+            std::unordered_map<std::string, StorageObjectMetadata> metadata;
+            if (!backend->GetObjectDataSize(storage_key) ||
+                !backend->BatchQuery({storage_key}, metadata)) {
+                return std::nullopt;
+            }
+            return metadata.at(storage_key).bucket_id;
+        };
+        auto local_value = [&]() -> std::string {
+            std::string actual(kSize, '\0');
+            std::unordered_map<std::string, Slice> read{
+                {storage_key, {actual.data(), actual.size()}}};
+            return backend->BatchLoad(read) ? actual : std::string();
+        };
+        auto master_has_our_replica = [&] {
+            auto query = client->Query(key);
+            if (!query) return false;
+            return std::any_of(query->replicas.begin(), query->replicas.end(),
+                               [&](const Replica::Descriptor& replica) {
+                                   const auto* disk =
+                                       std::get_if<LocalDiskDescriptor>(
+                                           &replica.descriptor_variant);
+                                   return disk != nullptr &&
+                                          disk->transport_endpoint == endpoint;
+                               });
+        };
+
+        put('o');
+        auto tasks = drain_tasks();
+        ASSERT_EQ(1, tasks.size());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        const auto first_bucket = bucket_of();
+        ASSERT_TRUE(first_bucket);
+        ASSERT_TRUE(master_has_our_replica());
+        const auto populated = StoredFileBytes(config.storage_filepath);
+        ASSERT_GT(populated, baseline);
+
+        switch (reclaim_case) {
+            case ReclaimCase::kRemoved:
+                ASSERT_TRUE(client->Remove(key, true));
+                // The first tick records the verdict, the next one acts.
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                storage.next_reclaim_at_ = {};
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kRePut: {
+                ASSERT_TRUE(client->Remove(key, true));
+                put('n');
+                tasks = drain_tasks();
+                ASSERT_EQ(1, tasks.size());
+                ASSERT_TRUE(storage.OffloadObjects(tasks));
+                const auto second_bucket = bucket_of();
+                ASSERT_TRUE(second_bucket);
+                EXPECT_NE(*first_bucket, *second_bucket);
+                EXPECT_EQ(std::string(kSize, 'n'), local_value());
+                EXPECT_TRUE(master_has_our_replica());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                break;
+            }
+            case ReclaimCase::kSegmentLost:
+                // The master lost our segment: nothing is reclaimed until a
+                // rescan for that loss has re-registered our objects.
+                ASSERT_TRUE(client->Remove(key, true));
+                storage.segment_lost_epoch_.fetch_add(1);
+                for (int i = 0; i < 2; ++i) {
+                    storage.next_reclaim_at_ = {};
+                    storage.ReclaimRemovedObjects();
+                }
+                EXPECT_TRUE(storage.reclaim_dead_keys_.empty());
+                EXPECT_EQ(first_bucket, bucket_of());
+                storage.rescanned_epoch_.store(
+                    storage.segment_lost_epoch_.load());
+                for (int i = 0; i < 2; ++i) {
+                    storage.next_reclaim_at_ = {};
+                    storage.ReclaimRemovedObjects();
+                }
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kOffloadFails:
+                // A failing offload does not stop the reclaim that would
+                // free the disk.
+                storage.enable_offloading_ = true;
+                ASSERT_TRUE(client->Remove(key, true));
+                ASSERT_TRUE(storage.Heartbeat());
+                put('x', "other-key");
+                backend->fail.store(true);
+                storage.next_reclaim_at_ = {};
+                EXPECT_FALSE(storage.Heartbeat());
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kRescanSkipsRePut:
+                // A rescan must not register the stale copy of a key that
+                // was put again: the master keeps the new value only.
+                ASSERT_TRUE(client->Remove(key, true));
+                put('n');
+                ASSERT_TRUE(storage.ReRegisterOffloadedObjects());
+                EXPECT_FALSE(master_has_our_replica());
+                tasks = drain_tasks();
+                ASSERT_EQ(1, tasks.size());
+                ASSERT_TRUE(storage.OffloadObjects(tasks));
+                EXPECT_EQ(std::string(kSize, 'n'), local_value());
+                EXPECT_TRUE(master_has_our_replica());
+                break;
+            case ReclaimCase::kStartupGate: {
+                // A restart: Init registers the key the master lacks and
+                // remembers the one it already has. Nothing is reclaimed
+                // until the deferred startup rescan has run, and that rescan
+                // does not bring back a key a client removed meanwhile.
+                put('x', "other-key");
+                tasks = drain_tasks();
+                ASSERT_EQ(1, tasks.size());
+                ASSERT_TRUE(storage.OffloadObjects(tasks));
+                ASSERT_TRUE(client->Remove(key, true));
+                ASSERT_TRUE(storage.ReRegisterOffloadedObjects(
+                    nullptr, &storage.startup_known_keys_));
+                EXPECT_TRUE(master_has_our_replica());
+                EXPECT_EQ(1, storage.startup_known_keys_.size());
+                storage.ArmStartupRescan();
+                ASSERT_TRUE(client->Remove(key, true));
+                for (int i = 0; i < 2; ++i) {
+                    storage.next_reclaim_at_ = {};
+                    ASSERT_TRUE(storage.Heartbeat());
+                }
+                EXPECT_FALSE(storage.rescan_future_.valid());
+                EXPECT_EQ(first_bucket, bucket_of());
+                storage.rescan_not_before_ = {};
+                ASSERT_TRUE(storage.Heartbeat());
+                ASSERT_TRUE(storage.rescan_future_.valid());
+                storage.rescan_future_.wait();
+                EXPECT_EQ(storage.rescanned_epoch_.load(),
+                          storage.segment_lost_epoch_.load());
+                EXPECT_FALSE(client->Query(key).has_value());
+                for (int i = 0; i < 2; ++i) {
+                    storage.next_reclaim_at_ = {};
+                    ASSERT_TRUE(storage.Heartbeat());
+                }
+                EXPECT_FALSE(bucket_of());
+                EXPECT_TRUE(storage.startup_known_keys_.empty());
+                break;
+            }
+            case ReclaimCase::kRescanQueryFails:
+                // No answer from the master is not "the master has it": the
+                // rescan fails and is retried.
+                master.Stop();
+                storage.segment_lost_epoch_.fetch_add(1);
+                EXPECT_FALSE(storage.ReRegisterOffloadedObjects());
+                return;
+            case ReclaimCase::kRetriedTask:
+                std::ignore = storage.OffloadObjects(tasks);
+                EXPECT_EQ(first_bucket, bucket_of());
+                EXPECT_EQ(std::string(kSize, 'o'), local_value());
+                EXPECT_TRUE(master_has_our_replica());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                break;
+        }
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
     void RunOrdinaryRemoveAllReclaimScenario(StorageBackendType backend_type) {
@@ -2671,6 +2931,38 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
         client.value()->OffloadObjectHeartbeat(true, offload_items);
     ASSERT_FALSE(heartbeat_rpc.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+TEST_F(FileStorageTest, ReclaimDeletesFilesOfRemovedObject) {
+    RunReclaimScenario(ReclaimCase::kRemoved);
+}
+
+TEST_F(FileStorageTest, ReclaimOffloadsRePutKeyAfresh) {
+    RunReclaimScenario(ReclaimCase::kRePut);
+}
+
+TEST_F(FileStorageTest, ReclaimWaitsForRescanAfterSegmentLoss) {
+    RunReclaimScenario(ReclaimCase::kSegmentLost);
+}
+
+TEST_F(FileStorageTest, ReclaimRunsWhenOffloadFails) {
+    RunReclaimScenario(ReclaimCase::kOffloadFails);
+}
+
+TEST_F(FileStorageTest, RescanSkipsStaleCopyOfRePutKey) {
+    RunReclaimScenario(ReclaimCase::kRescanSkipsRePut);
+}
+
+TEST_F(FileStorageTest, ReclaimWaitsForStartupRescan) {
+    RunReclaimScenario(ReclaimCase::kStartupGate);
+}
+
+TEST_F(FileStorageTest, RescanFailsWhenQueryFails) {
+    RunReclaimScenario(ReclaimCase::kRescanQueryFails);
+}
+
+TEST_F(FileStorageTest, ReclaimKeepsLiveCopyOnRetriedOffloadTask) {
+    RunReclaimScenario(ReclaimCase::kRetriedTask);
 }
 
 }  // namespace mooncake
