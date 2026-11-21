@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -33,6 +34,42 @@ namespace {
 bool CheckNeedsSyncfs(const char* op) {
     const std::string_view op_name(op);
     return op_name != "preadv" && op_name != "read";
+}
+
+void AppendFlightKeyUint64(std::string& destination, uint64_t value) {
+    for (size_t byte = 0; byte < sizeof(value); ++byte) {
+        destination.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
+    }
+}
+
+std::optional<std::string> BuildColdReadFlightKey(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (keys.empty() || keys.size() != sizes.size()) return std::nullopt;
+
+    std::vector<size_t> order(keys.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](size_t lhs, size_t rhs) { return keys[lhs] < keys[rhs]; });
+
+    size_t encoded_size = sizeof(uint64_t);
+    for (const auto& key : keys) {
+        encoded_size += 2 * sizeof(uint64_t) + key.size();
+    }
+    std::string flight_key;
+    flight_key.reserve(encoded_size);
+    AppendFlightKeyUint64(flight_key, keys.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        const size_t index = order[i];
+        if (i > 0 && keys[order[i - 1]] == keys[index]) {
+            // AllocateBatch's slice table is keyed by object key, so duplicate
+            // keys do not have an unambiguous one-to-one pointer mapping.
+            return std::nullopt;
+        }
+        AppendFlightKeyUint64(flight_key, keys[index].size());
+        flight_key.append(keys[index]);
+        AppendFlightKeyUint64(flight_key, static_cast<uint64_t>(sizes[index]));
+    }
+    return flight_key;
 }
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
@@ -164,6 +201,23 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 }
 
 FileStorage::~FileStorage() {
+    if (!Shutdown())
+        LOG(ERROR) << "FileStorage shutdown retained a registered arena";
+#ifdef USE_URING
+    // client_buffer_allocator_ frees the staging buffer after this body, so
+    // unpin it here: the source registration and every I/O thread's clone of
+    // it would otherwise keep the freed pages pinned for the process lifetime.
+    // The owner stops issuing I/O through this FileStorage before destroying
+    // it.
+    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
+#endif
+    for (const auto& root : disk_roots_) {
+        if (root.fd >= 0) ::close(root.fd);
+    }
+}
+
+tl::expected<void, ErrorCode> FileStorage::Shutdown() {
+    std::lock_guard lock(shutdown_mutex_);
     LOG(INFO) << "Shutdown FileStorage...";
     heartbeat_running_ = false;
     WakeHeartbeat();
@@ -176,17 +230,24 @@ FileStorage::~FileStorage() {
     }
     // A metadata rescan can still be reading through the storage backend.
     if (rescan_future_.valid()) rescan_future_.wait();
-#ifdef USE_URING
-    // client_buffer_allocator_ frees the staging buffer after this body, so
-    // unpin it here: the source registration and every I/O thread's clone of
-    // it would otherwise keep the freed pages pinned for the process lifetime.
-    // The owner stops issuing I/O through this FileStorage before destroying
-    // it.
-    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
-#endif
-    for (const auto& root : disk_roots_) {
-        if (root.fd >= 0) ::close(root.fd);
+    if (staging_registered_) {
+        auto result = client_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!result && result.error() != ErrorCode::NOT_REGISTERED) {
+            shutdown_error_ = result.error();
+            LOG(ERROR) << "Retaining FileStorage staging arena after "
+                          "unregister failure";
+            (void)new std::shared_ptr<ClientBufferAllocator>(
+                std::move(client_buffer_allocator_));
+        }
+        staging_registered_ = false;
     }
+    // All owned workers have stopped. Release this strong owner while the
+    // staging allocator is still alive, so Client's destructor can drain TE.
+    client_.reset();
+    if (shutdown_error_ != ErrorCode::OK)
+        return tl::unexpected(shutdown_error_);
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -272,6 +333,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             return scan_meta_result;
         }
     }
+    DisableReclaimOnExistingData();
 
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
@@ -393,9 +455,11 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
     return allocated_batch;
 }
 
-tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGetOnce(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
+    auto lease_timeout =
+        start_time + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
@@ -403,9 +467,10 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
-    MutexLocker locker(&client_buffer_mutex_);
-    client_buffer_allocated_batches_.emplace(batch_id,
-                                             std::move(allocated_batch));
+    auto& shard = ShardFor(batch_id);
+    MutexLocker locker(&shard.mutex);
+    shard.batches.emplace(
+        batch_id, ClientBufferEntry{std::move(allocated_batch), lease_timeout});
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
@@ -465,16 +530,101 @@ void FileStorage::PartitionUnbucketedTasks(
     }
 }
 
+// Source replacement must not let a later read join pre-mutation staging.
+struct FileStorage::ColdReadInvalidation {
+    FileStorage& storage;
+    explicit ColdReadInvalidation(FileStorage& owner) : storage(owner) {
+        storage.inflight_cold_reads_.Clear();
+    }
+    ~ColdReadInvalidation() { storage.inflight_cold_reads_.Clear(); }
+};
+
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadBatchShared(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes,
+                             bool prefer_pinned, std::string flight_key) {
+    // Pinned and ordinary staging are separate source-buffer contracts.
+    flight_key.push_back(prefer_pinned ? '\1' : '\0');
+    auto flight = inflight_cold_reads_.Acquire(flight_key);
+    if (!flight.IsLeader()) {
+        try {
+            return flight.Result().get();
+        } catch (const std::future_error&) {
+            // Preserve the existing abandoned-producer fallback.
+            return LoadBatch(keys, sizes, prefer_pinned);
+        }
+    }
+    auto result = LoadBatch(keys, sizes, prefer_pinned);
+    flight.Publish(result);
+    return result;
+}
+
+tl::expected<std::vector<uint64_t>, ErrorCode>
+FileStorage::StagingPointersInOrder(const AllocatedBatch& batch,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<int64_t>& sizes) {
+    std::vector<uint64_t> pointers;
+    pointers.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto slice = batch.slices.find(keys[i]);
+        if (sizes[i] < 0 || slice == batch.slices.end() ||
+            slice->second.size != static_cast<size_t>(sizes[i]))
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        pointers.push_back(reinterpret_cast<uintptr_t>(slice->second.ptr));
+    }
+    return pointers;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    auto key = BuildColdReadFlightKey(keys, sizes);
+    if (!key) return BatchGetOnce(keys, sizes);
+    auto loaded = LoadBatchShared(keys, sizes, false, std::move(*key));
+    if (!loaded) return tl::make_unexpected(loaded.error());
+    auto pointers = StagingPointersInOrder(**loaded, keys, sizes);
+    if (!pointers) return BatchGetOnce(keys, sizes);
+    // Register only the actual consumer's alias, not a hidden producer id.
+    return ShareStagingBuffer(*loaded, std::move(*pointers));
+}
+
+FileStorage::BatchGetResult FileStorage::ShareStagingBuffer(
+    const std::shared_ptr<AllocatedBatch>& staging,
+    std::vector<uint64_t> pointers) {
+    uint64_t alias_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+    auto lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    auto& shard = ShardFor(alias_id);
+    MutexLocker locker(&shard.mutex);
+    // The alias lease belongs to this table entry, not the shared staging
+    // object. Alias ids can land in different shards, so a shared deadline
+    // would otherwise be read and written under unrelated mutexes.
+    // Alias the leader's batch under a fresh id, so each reader releases its
+    // own id and the shared_ptr returns the staging memory to the pool when
+    // the last one goes away.
+    shard.batches.emplace(alias_id, ClientBufferEntry{staging, lease_timeout});
+    VLOG(1) << "Sharing staging buffer of batch_id " << staging->batch_id
+            << " as batch_id " << alias_id;
+    return BatchGetResult{alias_id, std::move(pointers)};
+}
+
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
-    auto load_result = LoadBatch(keys, sizes, true);
-    if (!load_result) return tl::make_unexpected(load_result.error());
-
-    auto batch = std::move(load_result.value());
+    auto key = BuildColdReadFlightKey(keys, sizes);
+    auto loaded = key ? LoadBatchShared(keys, sizes, true, *key)
+                      : LoadBatch(keys, sizes, true);
+    if (!loaded) return tl::make_unexpected(loaded.error());
     LocalBatchResult result;
-    result.pointers = std::move(batch->pointers);
-    result.owner = std::move(batch);
+    if (key) {
+        auto pointers = StagingPointersInOrder(**loaded, keys, sizes);
+        if (!pointers) return tl::make_unexpected(pointers.error());
+        result.pointers = std::move(*pointers);
+    } else {
+        result.pointers = (*loaded)->pointers;
+    }
+    // Shared metadata must remain immutable for the other readers.
+    result.owner = std::move(*loaded);
     return result;
 }
 
@@ -483,15 +633,19 @@ FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
                             const std::vector<int64_t>& offsets,
                             const std::vector<int64_t>& lengths,
                             const std::vector<int64_t>& object_sizes) {
+    const auto lease_timeout =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
     auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
-    MutexLocker locker(&client_buffer_mutex_);
-    client_buffer_allocated_batches_.emplace(batch_id,
-                                             std::move(allocated_batch));
+    auto& shard = ShardFor(batch_id);
+    MutexLocker locker(&shard.mutex);
+    shard.batches.emplace(
+        batch_id, ClientBufferEntry{std::move(allocated_batch), lease_timeout});
     return batch_result;
 }
 
@@ -565,6 +719,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::vector<std::vector<std::string>> buckets_keys;
     std::vector<std::string> deferred_keys;
     if (bucket_backend) {
+        DropStaleCopiesOfOffloadTargets(*bucket_backend, storage_object_sizes);
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
@@ -748,11 +903,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
-        auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler,
-            [this](const std::vector<std::string>& evicted_keys) {
-                return NotifyEvictedDiskReplicas(evicted_keys);
-            });
+        auto offload_res = [&] {
+            ColdReadInvalidation invalidate(*this);
+            return storage_backend_->BatchOffload(
+                host_batch_object, bucket_complete_handler,
+                [this](const std::vector<std::string>& evicted_keys) {
+                    return NotifyEvictedDiskReplicas(evicted_keys);
+                });
+        }();
 
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
@@ -902,12 +1060,15 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
-    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
-        config_.disk_eviction_high_watermark_ratio,
-        config_.disk_eviction_low_watermark_ratio,
-        [this](const std::vector<std::string>& evicted_keys) {
-            return NotifyEvictedDiskReplicas(evicted_keys);
-        });
+    auto eviction_result = [&] {
+        ColdReadInvalidation invalidate(*this);
+        return storage_backend_->EvictAboveDiskWatermark(
+            config_.disk_eviction_high_watermark_ratio,
+            config_.disk_eviction_low_watermark_ratio,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            });
+    }();
     if (!eviction_result) {
         return tl::make_unexpected(eviction_result.error());
     }
@@ -916,6 +1077,175 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
                   << eviction_result.value().size() << " LOCAL_DISK key(s)";
     }
     return {};
+}
+
+bool FileStorage::MasterKnowsOurObjects() const {
+    return !rescan_future_.valid() && !metadata_resync_pending_.load() &&
+           rescanned_epoch_.load() == segment_lost_epoch_.load();
+}
+
+void FileStorage::DisableReclaimOnExistingData() {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (config_.reclaim_interval_seconds == 0 || !bucket_backend) {
+        return;
+    }
+    auto store_metadata = bucket_backend->GetStoreMetadata();
+    if (store_metadata && store_metadata->total_keys == 0) {
+        return;
+    }
+    reclaim_disabled_ = true;
+    LOG(WARNING) << "Reclaim of removed objects is disabled: the offload "
+                    "directory was not empty at start";
+}
+
+bool FileStorage::FindDeadKeys(
+    const std::vector<std::pair<int64_t, std::string>>& bucket_keys,
+    bool offload_targets,
+    std::unordered_map<int64_t, std::vector<std::string>>& dead_keys) {
+    constexpr size_t kQueryChunk = 10'000;
+    std::unordered_map<TenantId, std::vector<size_t>, TenantIdHash>
+        indices_by_tenant;
+    for (size_t i = 0; i < bucket_keys.size(); ++i) {
+        indices_by_tenant[TenantId::ParseScopedKey(bucket_keys[i].second).first]
+            .push_back(i);
+    }
+    const auto is_ours = [this](const Replica::Descriptor& replica) {
+        const auto* disk =
+            std::get_if<LocalDiskDescriptor>(&replica.descriptor_variant);
+        return disk != nullptr && disk->transport_endpoint == local_rpc_addr_;
+    };
+    for (const auto& [tenant_id, indices] : indices_by_tenant) {
+        for (size_t begin = 0; begin < indices.size(); begin += kQueryChunk) {
+            const size_t end = std::min(indices.size(), begin + kQueryChunk);
+            std::vector<std::string> keys;
+            keys.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                keys.push_back(
+                    TenantId::ParseScopedKey(bucket_keys[indices[i]].second)
+                        .second);
+            }
+            auto results = client_->BatchQueryReadOnly(keys, tenant_id.value());
+            if (results.size() != keys.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < results.size(); ++i) {
+                // A stored key is dead once the master no longer has the
+                // object. Its replica list is not used for that: it shows
+                // readable replicas only, and ours may be briefly unreadable.
+                // An offload target is dead here when the master has the
+                // object (it just asked for it) without our replica.
+                bool dead = false;
+                if (results[i]) {
+                    dead = offload_targets &&
+                           std::none_of(results[i]->replicas.begin(),
+                                        results[i]->replicas.end(), is_ours);
+                } else if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    dead = !offload_targets;
+                } else if (results[i].error() !=
+                           ErrorCode::REPLICA_IS_NOT_READY) {
+                    return false;
+                }
+                if (dead) {
+                    const auto& [bucket_id, storage_key] =
+                        bucket_keys[indices[begin + i]];
+                    dead_keys[bucket_id].push_back(storage_key);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void FileStorage::DropStaleCopiesOfOffloadTargets(
+    BucketStorageBackend& backend,
+    const std::unordered_map<std::string, int64_t>& storage_object_sizes) {
+    if (config_.reclaim_interval_seconds == 0 || !MasterKnowsOurObjects()) {
+        return;
+    }
+    // The master asks this holder to offload a key only while it has no
+    // LOCAL_DISK replica here, so a key we still map is a stale copy of a
+    // removed object, unless the master says otherwise. Left alone, the
+    // fresh value would be skipped as already persisted.
+    std::vector<std::pair<int64_t, std::string>> mapped;
+    for (const auto& [storage_key, size] : storage_object_sizes) {
+        auto exists = backend.IsExist(storage_key);
+        if (!exists || !*exists) {
+            continue;
+        }
+        std::unordered_map<std::string, StorageObjectMetadata> metadata;
+        if (backend.BatchQuery({storage_key}, metadata)) {
+            mapped.emplace_back(metadata.at(storage_key).bucket_id,
+                                storage_key);
+        }
+    }
+    std::unordered_map<int64_t, std::vector<std::string>> stale;
+    if (!mapped.empty() &&
+        FindDeadKeys(mapped, /*offload_targets=*/true, stale)) {
+        ColdReadInvalidation invalidate(*this);
+        backend.UnmapKeys(stale);
+    }
+}
+
+void FileStorage::ReclaimRemovedObjects() {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend) {
+        return;
+    }
+    // Until a rescan has re-registered our objects with a master that lost
+    // our segment, that master does not know them; verdicts taken against
+    // it, or before it, are void.
+    if (config_.reclaim_interval_seconds == 0 || reclaim_disabled_ ||
+        !MasterKnowsOurObjects()) {
+        reclaim_dead_keys_.clear();
+        return;
+    }
+    auto verdicts = std::move(reclaim_dead_keys_);
+    reclaim_dead_keys_.clear();
+
+    const auto now = std::chrono::steady_clock::now();
+    auto store_metadata = bucket_backend->GetStoreMetadata();
+    if (now >= next_reclaim_at_ && store_metadata) {
+        next_reclaim_at_ =
+            now + std::chrono::seconds(config_.reclaim_interval_seconds);
+        // A lap covers the keys stored at its start in cycle/interval
+        // passes, so it takes about reclaim_cycle_seconds whatever the disk
+        // size. The share is fixed per lap: recomputing it from a key count
+        // that shrinks as buckets go would only decay geometrically.
+        if (reclaim_passes_left_ == 0) {
+            reclaim_passes_left_ =
+                std::max<uint32_t>(1, config_.reclaim_cycle_seconds /
+                                          config_.reclaim_interval_seconds);
+            reclaim_keys_per_pass_ = std::max<size_t>(
+                1, (store_metadata->total_keys + reclaim_passes_left_ - 1) /
+                       reclaim_passes_left_);
+        }
+        --reclaim_passes_left_;
+
+        std::vector<std::pair<int64_t, std::string>> bucket_keys;
+        for (auto& [bucket_id, storage_keys] :
+             bucket_backend->GetReclaimCandidates(
+                 reclaim_cursor_, reclaim_keys_per_pass_, reclaim_cursor_)) {
+            reclaim_dead_keys_[bucket_id];
+            for (auto& storage_key : storage_keys) {
+                bucket_keys.emplace_back(bucket_id, std::move(storage_key));
+            }
+        }
+        // A master that does not answer for every key voids this pass and
+        // the previous one's verdicts; a later pass takes them again.
+        if (!FindDeadKeys(bucket_keys, /*offload_targets=*/false,
+                          reclaim_dead_keys_)) {
+            LOG(WARNING) << "Reclaim pass skipped: the master did not answer "
+                            "for every key";
+            reclaim_dead_keys_.clear();
+            return;
+        }
+    }
+    if (!verdicts.empty()) {
+        ColdReadInvalidation invalidate(*this);
+        bucket_backend->RemoveDeadBuckets(verdicts);
+    }
 }
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
@@ -956,20 +1286,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         rescan_future_ = std::future<void>();
     }
 
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
-        LOG(INFO) << "Retrying background metadata rescan";
-        rescan_future_ = std::async(std::launch::async, [this]() {
-            auto result = ReRegisterOffloadedObjects();
-            if (!result) {
-                LOG(ERROR) << "Background metadata rescan retry "
-                           << "failed: " << result.error();
-            } else {
-                metadata_resync_pending_.store(false);
-            }
-        });
-    }
-
     std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 
@@ -999,6 +1315,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
+                // A rescan is owed from here on, even if the remount reply
+                // or the retried heartbeat below is lost.
+                segment_lost_epoch_.fetch_add(1);
+                reclaim_dead_keys_.clear();
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
@@ -1028,13 +1348,15 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                         LOG(INFO) << "Triggering background metadata rescan "
                                   << "after LOCAL_DISK segment re-registration";
                         metadata_resync_pending_.store(true);
-                        rescan_future_ =
-                            std::async(std::launch::async, [this]() {
+                        rescan_future_ = std::async(
+                            std::launch::async,
+                            [this, epoch = segment_lost_epoch_.load()]() {
                                 auto result = ReRegisterOffloadedObjects();
                                 if (!result) {
                                     LOG(ERROR) << "Background metadata rescan "
                                                << "failed: " << result.error();
                                 } else {
+                                    rescanned_epoch_.store(epoch);
                                     metadata_resync_pending_.store(false);
                                 }
                             });
@@ -1051,6 +1373,27 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    // Retry metadata resync if previous attempt failed, or if the segment
+    // was lost again after the last rescan started. Only after a heartbeat
+    // that succeeded: a rescan against an unmounted segment cannot register
+    // anything.
+    if ((metadata_resync_pending_.load() ||
+         rescanned_epoch_.load() != segment_lost_epoch_.load()) &&
+        !rescan_future_.valid()) {
+        LOG(INFO) << "Retrying background metadata rescan";
+        rescan_future_ = std::async(
+            std::launch::async, [this, epoch = segment_lost_epoch_.load()]() {
+                auto result = ReRegisterOffloadedObjects();
+                if (!result) {
+                    LOG(ERROR) << "Background metadata rescan retry "
+                               << "failed: " << result.error();
+                } else {
+                    rescanned_epoch_.store(epoch);
+                    metadata_resync_pending_.store(false);
+                }
+            });
+    }
+
     // Generic removal reclaims files through metadata-checked eviction, not a
     // backend-wide wipe that could remove managed objects or another tenant.
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
@@ -1059,12 +1402,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
+            // A full disk is a reason to reclaim, not to skip it.
+            ReclaimRemovedObjects();
             return offload_result;
         }
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
+
+    ReclaimRemovedObjects();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
@@ -1088,6 +1435,7 @@ void FileStorage::RemoveAll() {
     // must not request it; callers must ensure no live object depends on the
     // files being removed.
     if (storage_backend_) {
+        ColdReadInvalidation invalidate(*this);
         storage_backend_->RemoveAll();
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
@@ -1644,6 +1992,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
     }
+    staging_registered_ = true;
     return {};
 }
 
@@ -1658,10 +2007,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    std::chrono::steady_clock::time_point now =
-        std::chrono::steady_clock::now();
-    auto lease_timeout =
-        now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     static constexpr size_t kDirectIOAlignment = 4096;
 
     u_int64_t total_size = 0;
@@ -1687,14 +2032,16 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             &allocator == client_buffer_allocator_.get()) {
             gc_triggered = true;
             {
-                MutexLocker locker(&client_buffer_mutex_);
                 auto gc_now = std::chrono::steady_clock::now();
-                for (auto it = client_buffer_allocated_batches_.begin();
-                     it != client_buffer_allocated_batches_.end();) {
-                    if (gc_now >= it->second->lease_timeout) {
-                        it = client_buffer_allocated_batches_.erase(it);
-                    } else {
-                        ++it;
+                for (auto& shard : client_buffer_shards_) {
+                    MutexLocker locker(&shard.mutex);
+                    for (auto it = shard.batches.begin();
+                         it != shard.batches.end();) {
+                        if (gc_now >= it->second.lease_timeout) {
+                            it = shard.batches.erase(it);
+                        } else {
+                            ++it;
+                        }
                     }
                 }
             }
@@ -1718,7 +2065,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         // correction)
         result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
-        result->lease_timeout = lease_timeout;
     }
     result->total_size = total_size;
     return result;
@@ -1728,15 +2074,15 @@ void FileStorage::ClientBufferGCThreadFunc() {
     LOG(INFO) << "action=client_buffer_gc_thread_started";
     while (client_buffer_gc_running_) {
         {
-            MutexLocker locker(&client_buffer_mutex_);
-            if (!client_buffer_allocated_batches_.empty()) {
-                auto now = std::chrono::steady_clock::now();
-                for (auto it = client_buffer_allocated_batches_.begin();
-                     it != client_buffer_allocated_batches_.end();) {
-                    if (now >= it->second->lease_timeout) {
+            auto now = std::chrono::steady_clock::now();
+            for (auto& shard : client_buffer_shards_) {
+                MutexLocker locker(&shard.mutex);
+                for (auto it = shard.batches.begin();
+                     it != shard.batches.end();) {
+                    if (now >= it->second.lease_timeout) {
                         VLOG(1) << "GC releasing batch_id: " << it->first
                                 << " (lease expired)";
-                        it = client_buffer_allocated_batches_.erase(it);
+                        it = shard.batches.erase(it);
                     } else {
                         ++it;
                     }
@@ -1758,12 +2104,16 @@ tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
-    MutexLocker locker(&client_buffer_mutex_);
-    auto it = client_buffer_allocated_batches_.find(batch_id);
-    if (it != client_buffer_allocated_batches_.end()) {
+    auto& shard = ShardFor(batch_id);
+    MutexLocker locker(&shard.mutex);
+    auto it = shard.batches.find(batch_id);
+    if (it != shard.batches.end()) {
+        // A singleflight waiter's id aliases its leader's batch, so several
+        // ids can map to one staging buffer; erasing this id drops one
+        // reference and the last one returns the memory to the pool.
         VLOG(1) << "Releasing buffer for batch_id: " << batch_id
                 << " (transfer completed)";
-        client_buffer_allocated_batches_.erase(it);
+        shard.batches.erase(it);
         return true;
     }
     VLOG(1) << "batch_id " << batch_id
